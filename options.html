@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Proxer — настройки</title>
+    <link rel="stylesheet" href="options.css" />
+  </head>
+  <body>
+    <main>
+      <h1>Proxer</h1>
+
+      <section class="card">
+        <h2>Прокси-сервер</h2>
+        <div class="grid">
+          <label for="scheme">Схема</label>
+          <select id="scheme">
+            <option value="http">HTTP (для сайтов http и https)</option>
+            <option value="socks5">SOCKS5</option>
+          </select>
+
+          <label for="address">Адрес</label>
+          <input id="address" type="text" placeholder="1.2.3.4:8080 или socks5://1.2.3.4:1080" />
+
+          <label for="username">Логин</label>
+          <input id="username" type="text" autocomplete="off" />
+
+          <label for="password">Пароль</label>
+          <input id="password" type="password" autocomplete="off" />
+        </div>
+        <p id="socks-hint" class="hint" hidden>
+          Chrome не поддерживает авторизацию SOCKS5 — логин и пароль недоступны.
+        </p>
+        <div class="row">
+          <button id="save-proxy" type="button">Сохранить прокси</button>
+          <span id="proxy-status" class="status" role="status"></span>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Добавить сайт</h2>
+        <div class="row">
+          <input id="domain-input" type="text" placeholder="example.com или https://example.com/path" />
+          <button id="add-domain" type="button">Добавить</button>
+        </div>
+        <p id="domain-status" class="status" role="status"></p>
+      </section>
+
+      <section class="card">
+        <h2>Сайты через прокси</h2>
+        <ul id="domain-list"></ul>
+      </section>
+
+      <section class="card">
+        <h2>Состояние</h2>
+        <p id="control-banner" class="banner" hidden></p>
+        <p id="error-banner" class="banner error" hidden></p>
+        <dl>
+          <dt>Прокси</dt>
+          <dd id="current-proxy">не настроен</dd>
+          <dt>Сайтов в списке</dt>
+          <dd id="domain-count">0</dd>
+        </dl>
+      </section>
+    </main>
+    <script type="module" src="options.js"></script>
+  </body>
+</html>
