@@ -159,3 +159,9 @@ dt {
 dd {
   margin: 0;
 }
+
+.actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
