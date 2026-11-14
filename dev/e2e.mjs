@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import { once } from "node:events";
 import { mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
 import http from "node:http";
+import https from "node:https";
+import net from "node:net";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -49,18 +51,32 @@ function pageServer(marker) {
   });
 }
 
-function proxyServer(marker, log, credentials = null) {
-  const expected = credentials
-    ? `Basic ${Buffer.from(`${credentials.username}:${credentials.password}`).toString("base64")}`
+function proxyServer(marker, log, options = {}) {
+  const expected = options.credentials
+    ? `Basic ${Buffer.from(`${options.credentials.username}:${options.credentials.password}`).toString("base64")}`
     : null;
+  const tlsPort = options.tlsPort || 0;
+  const dropPlainHttp = Boolean(options.dropPlainHttp);
 
-  const server = http.createServer((req, res) => {
+  const authorize = (req, res, respond) => {
     const header = req.headers["proxy-authorization"] || "";
-
     if (expected && header !== expected) {
       log.push(`407 ${req.url}`);
+      respond("407");
+      return false;
+    }
+    return true;
+  };
+
+  const server = http.createServer((req, res) => {
+    if (!authorize(req, res, () => {
       res.writeHead(407, { "proxy-authenticate": 'Basic realm="proxer"', "content-type": "text/plain" });
       res.end("proxy auth required");
+    })) return;
+
+    if (dropPlainHttp) {
+      log.push(`DROP-HTTP ${req.url}`);
+      req.socket.destroy();
       return;
     }
 
@@ -68,11 +84,58 @@ function proxyServer(marker, log, credentials = null) {
     res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
     res.end(`<!doctype html><html><body>${marker}</body></html>`);
   });
-  server.on("connect", (req, socket) => {
+
+  server.on("connect", (req, socket, head) => {
+    const header = req.headers["proxy-authorization"] || "";
+    if (expected && header !== expected) {
+      log.push(`407 ${req.url}`);
+      socket.write('HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="proxer"\r\n\r\n');
+      socket.end();
+      return;
+    }
+
     log.push(`CONNECT ${req.url}`);
-    socket.end("HTTP/1.1 502 Bad Gateway\r\n\r\n");
+
+    if (!tlsPort) {
+      socket.end("HTTP/1.1 502 Bad Gateway\r\n\r\n");
+      return;
+    }
+
+    socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+    const upstream = net.connect(tlsPort, "127.0.0.1", () => {
+      if (head && head.length) upstream.write(head);
+      socket.pipe(upstream).pipe(socket);
+    });
+    upstream.on("error", () => socket.destroy());
+    socket.on("error", () => upstream.destroy());
   });
+
   return server;
+}
+
+async function startTlsServer(marker) {
+  const dir = await mkdtemp(path.join(tmpdir(), "proxer-e2e-cert-"));
+  const keyPath = path.join(dir, "key.pem");
+  const certPath = path.join(dir, "cert.pem");
+
+  execFileSync("openssl", [
+    "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2",
+    "-subj", "/CN=proxer-e2e",
+    "-addext", "subjectAltName=DNS:target.test,DNS:control.test,DNS:example.com",
+    "-keyout", keyPath,
+    "-out", certPath
+  ], { stdio: "ignore" });
+
+  const [key, cert] = await Promise.all([readFile(keyPath, "utf8"), readFile(certPath, "utf8")]);
+  const server = https.createServer({ key, cert }, (_req, res) => {
+    res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+    res.end(`<!doctype html><html><body>${marker}</body></html>`);
+  });
+
+  return {
+    server,
+    cleanup: () => rm(dir, { recursive: true, force: true })
+  };
 }
 
 async function waitForDevToolsPort(profileDir, child) {
@@ -176,12 +239,21 @@ async function main() {
   const upstream = pageServer("direct-ok");
   const upstreamPort = await listen(upstream);
 
+  const tls = await startTlsServer("tls-ok");
+  const tlsPort = await listen(tls.server);
+
   const proxyLog = [];
-  const proxy = proxyServer("proxied-ok", proxyLog);
+  const proxy = proxyServer("proxied-ok", proxyLog, { tlsPort });
   const proxyPort = await listen(proxy);
 
+  // Прокси, который разрешает только CONNECT (HTTPS) и рвёт обычный HTTP — так ведут
+  // себя реальные прокси, на которых проверка обязана проходить, а не падать.
+  const connectOnlyLog = [];
+  const connectOnlyProxy = proxyServer("connect-only-ok", connectOnlyLog, { tlsPort, dropPlainHttp: true });
+  const connectOnlyPort = await listen(connectOnlyProxy);
+
   const authLog = [];
-  const authProxy = proxyServer("auth-ok", authLog, { username: "proxer", password: "s3cret" });
+  const authProxy = proxyServer("auth-ok", authLog, { tlsPort, credentials: { username: "proxer", password: "s3cret" } });
   const authProxyPort = await listen(authProxy);
 
   const closedServer = pageServer("");
@@ -198,6 +270,7 @@ async function main() {
     "--no-sandbox",
     "--disable-dev-shm-usage",
     "--disable-gpu",
+    "--ignore-certificate-errors",
     "--remote-debugging-port=0",
     "--host-resolver-rules=MAP target.test 127.0.0.1, MAP control.test 127.0.0.1"
   ];
@@ -333,7 +406,32 @@ async function main() {
     const afterFail = await storedConfig();
     assert.equal(afterFail.port, proxyPort, `сохранение не должно было пройти, в конфиге порт ${afterFail.port}`);
 
-    await fill("address", `127.0.0.1:${authProxyPort}`);
+    // Регрессия: прокси, разрешающий только HTTPS/CONNECT. Реальный сайт через него
+    // открывается, значит и проверка обязана говорить «доступен».
+    await configure({
+      ...workingProxy,
+      proxy: { scheme: "http", host: "127.0.0.1", port: connectOnlyPort, username: "", password: "" }
+    });
+
+    const connectOnlySite = await openPage(browser, "https://target.test/", { waitForLoad: false });
+    const connectOnlyText = await waitForText(browser, connectOnlySite, "document.body.innerText", {
+      timeout: 20000,
+      label: "браузинг через connect-only прокси"
+    });
+    assert.match(connectOnlyText, /tls-ok/, "сайт не открылся через connect-only прокси: " + connectOnlyText);
+    assert.ok(
+      connectOnlyLog.some((entry) => entry.startsWith("CONNECT target.test:443")),
+      "прокси не получил CONNECT: " + JSON.stringify(connectOnlyLog)
+    );
+
+    await fill("address", "127.0.0.1:" + connectOnlyPort);
+    const connectOnlyStatus = await clickAndAwaitStatus("check-proxy", "Прокси доступен");
+    assert.ok(
+      connectOnlyStatus.includes("127.0.0.1:" + connectOnlyPort),
+      "проверка не должна падать на прокси, разрешающем только HTTPS: " + connectOnlyStatus
+    );
+
+    await fill("address", "127.0.0.1:" + authProxyPort);
     await fill("username", "proxer");
     await fill("password", "s3cret");
     await clickAndAwaitStatus("save-proxy", "Прокси сохранён");
@@ -404,6 +502,8 @@ async function main() {
     await closeServer(upstream);
     await closeServer(proxy);
     await closeServer(authProxy);
+    await closeServer(connectOnlyProxy);
+    await tls.cleanup();
     await rm(profileDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
   }
 }
