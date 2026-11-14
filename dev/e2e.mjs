@@ -205,6 +205,15 @@ async function main() {
     const optionsText = await evaluate(browser, optionsSession, "document.body.innerText");
     assert.match(optionsText, /Прокси-сервер/, "страница настроек не отрендерилась");
 
+    const commands = await evaluate(
+      browser,
+      optionsSession,
+      "(async () => (await chrome.commands.getAll()).map((c) => ({ name: c.name, shortcut: c.shortcut })))()"
+    );
+    const toggleCommand = commands.find((command) => command.name === "toggle-site");
+    assert.ok(toggleCommand, "команда toggle-site не зарегистрирована");
+    assert.ok(toggleCommand.shortcut, "у команды toggle-site нет горячей клавиши");
+
     const configure = (config) =>
       evaluate(
         browser,
@@ -241,6 +250,21 @@ async function main() {
       false,
       "домен вне списка попал в прокси"
     );
+
+    const badgeFor = (host) =>
+      evaluate(
+        browser,
+        optionsSession,
+        `(async () => {
+           const tabs = await chrome.tabs.query({});
+           const tab = tabs.find((item) => (item.url || "").includes("${host}"));
+           if (!tab) return "no-tab";
+           return chrome.action.getBadgeText({ tabId: tab.id });
+         })()`
+      );
+
+    assert.equal(await badgeFor("target.test"), "ON", "на покрытом сайте нет badge ON");
+    assert.equal(await badgeFor("control.test"), "", "на непокрытом сайте badge не должен стоять");
 
     await configure({
       ...workingProxy,
