@@ -81,6 +81,18 @@ button:hover {
   filter: brightness(1.08);
 }
 
+button:disabled {
+  opacity: 0.55;
+  cursor: default;
+  filter: none;
+}
+
+button.secondary {
+  background: transparent;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+}
+
 button.danger {
   background: var(--danger);
   padding: 4px 10px;

@@ -103,26 +103,111 @@ async function renderControl() {
 
 schemeSelect.addEventListener("change", syncSchemeFields);
 
-$("save-proxy").addEventListener("click", async () => {
+const PROBE_TIMEOUT_MS = 10000;
+
+const saveProxyButton = $("save-proxy");
+const checkProxyButton = $("check-proxy");
+
+function formatReason(reason) {
+  if (!reason) return "Причина неизвестна.";
+  return reason.title ? `${reason.title}. ${reason.detail}` : reason.detail;
+}
+
+function setProbeBusy(busy) {
+  saveProxyButton.disabled = busy;
+  checkProxyButton.disabled = busy;
+  if (busy) setStatus(proxyStatus, "Проверяю прокси…");
+}
+
+async function runProbe(candidate) {
+  const started = await chrome.runtime.sendMessage({ type: "probe-start", proxy: candidate });
+  if (!started || !started.ok) {
+    return { ok: false, error: formatReason(started && started.reason) };
+  }
+
+  let fetchFailed = false;
+  let failureName = "";
+  try {
+    await fetch(started.url, {
+      mode: "no-cors",
+      cache: "no-store",
+      credentials: "omit",
+      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS)
+    });
+  } catch (error) {
+    fetchFailed = true;
+    failureName = (error && error.name) || "";
+  }
+
+  const finished = await chrome.runtime.sendMessage({
+    type: "probe-finish",
+    token: started.token,
+    fetchFailed,
+    failureName
+  });
+
+  if (finished && finished.ok) return { ok: true, endpoint: started.endpoint };
+  return { ok: false, error: formatReason(finished && finished.reason), code: finished && finished.code };
+}
+
+function currentFormPatch() {
   const username = usernameInput.value.trim();
   const existingPassword = config.proxy ? config.proxy.password : "";
-  const patch = buildProxyPatch(config, {
+  return buildProxyPatch(config, {
     scheme: schemeSelect.value,
     address: addressInput.value,
     username,
     password: username ? passwordInput.value || existingPassword : ""
   });
+}
 
+saveProxyButton.addEventListener("click", async () => {
+  const patch = currentFormPatch();
   if (!patch.ok) {
     setStatus(proxyStatus, patch.error, true);
+    return;
+  }
+
+  setProbeBusy(true);
+  let probe;
+  try {
+    probe = await runProbe(patch.config.proxy);
+  } finally {
+    setProbeBusy(false);
+  }
+
+  if (!probe.ok) {
+    setStatus(proxyStatus, `Не сохранено: ${probe.error}`, true);
     return;
   }
 
   const result = await commitConfig(patch.config);
   config = result.config;
   render();
-  setStatus(proxyStatus, result.ok ? patch.notice || "Прокси сохранён" : result.error, !result.ok);
+  setStatus(proxyStatus, result.ok ? patch.notice || "Прокси сохранён и доступен" : result.error, !result.ok);
   await renderControl();
+});
+
+checkProxyButton.addEventListener("click", async () => {
+  const patch = currentFormPatch();
+  if (!patch.ok) {
+    setStatus(proxyStatus, patch.error, true);
+    return;
+  }
+
+  setProbeBusy(true);
+  let probe;
+  try {
+    probe = await runProbe(patch.config.proxy);
+  } finally {
+    setProbeBusy(false);
+  }
+
+  setStatus(
+    proxyStatus,
+    probe.ok ? `Прокси доступен: ${probe.endpoint}` : `Прокси недоступен: ${probe.error}`,
+    !probe.ok
+  );
 });
 
 $("add-domain").addEventListener("click", async () => {
