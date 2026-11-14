@@ -113,6 +113,29 @@ function proxyServer(marker, log, options = {}) {
   return server;
 }
 
+function galleryProxyServer(log, imagePort) {
+  const PNG = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+    "base64"
+  );
+
+  return http.createServer((req, res) => {
+    const url = req.url || "";
+    log.push(url);
+
+    if (url.includes("cdn.test")) {
+      res.writeHead(200, { "content-type": "image/png", "content-length": PNG.length });
+      res.end(PNG);
+      return;
+    }
+
+    res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+    res.end(
+      `<!doctype html><html><body>gallery-ok<img id="pic" src="http://cdn.test:${imagePort}/img.png"></body></html>`
+    );
+  });
+}
+
 async function startTlsServer(marker) {
   const dir = await mkdtemp(path.join(tmpdir(), "proxer-e2e-cert-"));
   const keyPath = path.join(dir, "key.pem");
@@ -225,6 +248,15 @@ async function evaluate(browser, sessionId, expression) {
   return result.result ? result.result.value : undefined;
 }
 
+async function waitFor(predicate, { timeout = 20000, label = "условие" } = {}) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (await predicate()) return true;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(`Не дождались: ${label}`);
+}
+
 async function waitForText(browser, sessionId, expression, { timeout = 20000, label = "условие" } = {}) {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
@@ -259,6 +291,12 @@ async function main() {
   const closedServer = pageServer("");
   const closedPort = await listen(closedServer);
   await closeServer(closedServer);
+
+  // Картинка лежит на чужом домене и по прямому адресу (закрытый порт) недоступна,
+  // а через прокси — доступна. Ровно случай "видео/картинки не грузятся".
+  const galleryLog = [];
+  const galleryProxy = galleryProxyServer(galleryLog, closedPort);
+  const galleryPort = await listen(galleryProxy);
 
   const profileDir = await mkdtemp(path.join(tmpdir(), "proxer-e2e-"));
   const args = [
@@ -462,6 +500,98 @@ async function main() {
       `повторный запрос с кредами не дошёл: ${JSON.stringify(authLog)}`
     );
 
+    // Регрессия "видео/картинки не грузятся": страница на покрытом сайте тянет
+    // картинку с чужого домена. Напрямую она недоступна, поэтому расширение должно
+    // предложить домен, а после добавления — пустить его через прокси.
+    await configure({
+      version: 1,
+      proxy: { scheme: "http", host: "127.0.0.1", port: galleryPort, username: "", password: "" },
+      domains: ["target.test"],
+      lastError: null
+    });
+
+    const gallerySession = await openPage(browser, "http://target.test/gallery");
+    const galleryText = await evaluate(browser, gallerySession, "document.body.innerText");
+    assert.match(galleryText, /gallery-ok/, "страница галереи не открылась: " + galleryText);
+
+    const suggestion = await waitForText(
+      browser,
+      optionsSession,
+      `(async () => {
+         const response = await chrome.runtime.sendMessage({ type: "suggestions-list" });
+         const list = (response && response.suggestions) || [];
+         const found = list.find((item) => item.domain === "cdn.test");
+         return found ? JSON.stringify(found) : "";
+       })()`,
+      { timeout: 20000, label: "подсказка cdn.test" }
+    );
+    assert.match(suggestion, /target\.test/, "подсказка привязана не к тому сайту: " + suggestion);
+    assert.equal(
+      galleryLog.some((entry) => entry.includes("cdn.test")),
+      false,
+      "картинка не должна была попасть в прокси до добавления"
+    );
+
+    const badgeBefore = await waitForText(
+      browser,
+      optionsSession,
+      `(async () => {
+         const tabs = await chrome.tabs.query({});
+         const tab = tabs.find((item) => (item.url || "").includes("target.test/gallery"));
+         if (!tab) return "";
+         const text = await chrome.action.getBadgeText({ tabId: tab.id });
+         return /^\\+\\d+$/.test(text) ? text : "";
+       })()`,
+      { timeout: 15000, label: "badge с количеством непроксируемых доменов" }
+    );
+    assert.match(badgeBefore, /^\+\d+$/, "badge должен показывать количество: " + badgeBefore);
+
+    const clicked = await evaluate(
+      browser,
+      optionsSession,
+      `(() => {
+         const button = document.querySelector("#suggestion-list li button:not(.secondary)");
+         if (!button) return "";
+         button.click();
+         return "clicked";
+       })()`
+    );
+    assert.equal(clicked, "clicked", "в блоке подсказок нет кнопки Добавить");
+
+    const domainsAfterApply = await waitForText(
+      browser,
+      optionsSession,
+      `(async () => {
+         const { loadConfig, invalidateConfigCache } = await import("./store.js");
+         invalidateConfigCache();
+         const config = await loadConfig();
+         return config.domains.includes("cdn.test") ? config.domains.join(",") : "";
+       })()`,
+      { timeout: 15000, label: "cdn.test в списке доменов" }
+    );
+    assert.match(domainsAfterApply, /cdn\.test/);
+
+    await evaluate(browser, gallerySession, "location.reload()");
+
+    await waitFor(
+      () => galleryLog.some((entry) => entry.includes("cdn.test")),
+      { timeout: 20000, label: "картинка пошла через прокси" }
+    );
+
+    const badgeAfter = await waitForText(
+      browser,
+      optionsSession,
+      `(async () => {
+         const tabs = await chrome.tabs.query({});
+         const tab = tabs.find((item) => (item.url || "").includes("target.test/gallery"));
+         if (!tab) return "";
+         const text = await chrome.action.getBadgeText({ tabId: tab.id });
+         return text === "ON" ? "ON" : "";
+       })()`,
+      { timeout: 15000, label: "badge вернулся к ON" }
+    );
+    assert.equal(badgeAfter, "ON");
+
     await configure({
       ...workingProxy,
       proxy: { ...workingProxy.proxy, port: closedPort }
@@ -503,6 +633,7 @@ async function main() {
     await closeServer(proxy);
     await closeServer(authProxy);
     await closeServer(connectOnlyProxy);
+    await closeServer(galleryProxy);
     await tls.cleanup();
     await rm(profileDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
   }
