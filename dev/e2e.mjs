@@ -49,8 +49,21 @@ function pageServer(marker) {
   });
 }
 
-function proxyServer(marker, log) {
+function proxyServer(marker, log, credentials = null) {
+  const expected = credentials
+    ? `Basic ${Buffer.from(`${credentials.username}:${credentials.password}`).toString("base64")}`
+    : null;
+
   const server = http.createServer((req, res) => {
+    const header = req.headers["proxy-authorization"] || "";
+
+    if (expected && header !== expected) {
+      log.push(`407 ${req.url}`);
+      res.writeHead(407, { "proxy-authenticate": 'Basic realm="proxer"', "content-type": "text/plain" });
+      res.end("proxy auth required");
+      return;
+    }
+
     log.push(req.url);
     res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
     res.end(`<!doctype html><html><body>${marker}</body></html>`);
@@ -167,6 +180,10 @@ async function main() {
   const proxy = proxyServer("proxied-ok", proxyLog);
   const proxyPort = await listen(proxy);
 
+  const authLog = [];
+  const authProxy = proxyServer("auth-ok", authLog, { username: "proxer", password: "s3cret" });
+  const authProxyPort = await listen(authProxy);
+
   const closedServer = pageServer("");
   const closedPort = await listen(closedServer);
   await closeServer(closedServer);
@@ -268,6 +285,29 @@ async function main() {
 
     await configure({
       ...workingProxy,
+      proxy: {
+        scheme: "http",
+        host: "127.0.0.1",
+        port: authProxyPort,
+        username: "proxer",
+        password: "s3cret"
+      }
+    });
+
+    const authSession = await openPage(browser, `http://target.test:${upstreamPort}/auth`);
+    const authText = await evaluate(browser, authSession, "document.body.innerText");
+    assert.match(authText, /auth-ok/, `прокси с авторизацией не пропустил запрос: ${authText}`);
+    assert.ok(
+      authLog.some((entry) => entry.startsWith("407 ")),
+      `прокси не отправил 407: ${JSON.stringify(authLog)}`
+    );
+    assert.ok(
+      authLog.some((entry) => entry.includes("/auth")),
+      `повторный запрос с кредами не дошёл: ${JSON.stringify(authLog)}`
+    );
+
+    await configure({
+      ...workingProxy,
       proxy: { ...workingProxy.proxy, port: closedPort }
     });
 
@@ -305,6 +345,7 @@ async function main() {
     }
     await closeServer(upstream);
     await closeServer(proxy);
+    await closeServer(authProxy);
     await rm(profileDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
   }
 }
