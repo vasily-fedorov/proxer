@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Proxer — прокси недоступен</title>
+    <link rel="stylesheet" href="options.css" />
+    <style>
+      body {
+        padding-top: 64px;
+      }
+      .error-title {
+        color: var(--danger);
+        font-size: 20px;
+        margin: 0 0 8px;
+      }
+      .error-detail {
+        margin: 0 0 4px;
+      }
+      .error-endpoint {
+        color: var(--muted);
+        margin: 0 0 20px;
+      }
+      .actions {
+        display: flex;
+        gap: 8px;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1 class="error-title" id="error-heading">Не удалось открыть сайт через прокси</h1>
+      <p class="error-detail" id="error-detail"></p>
+      <p class="error-endpoint" id="error-endpoint"></p>
+      <div class="actions">
+        <button id="retry" type="button">Повторить</button>
+        <button id="open-options" type="button">Настройки</button>
+      </div>
+    </main>
+    <script type="module" src="proxy-error.js"></script>
+  </body>
+</html>
