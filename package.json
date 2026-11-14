@@ -1,0 +1,11 @@
+{
+  "name": "proxer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Chrome-расширение: прокси для выбранных сайтов в один клик",
+  "scripts": {
+    "test": "node --test",
+    "test:e2e": "node dev/e2e.mjs"
+  }
+}
