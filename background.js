@@ -1,11 +1,12 @@
 import { findCoveringRule, normalizeDomain, toggleDomain } from "./lib/domains.js";
 import { describeProxyError, readErrorCode } from "./lib/errors.js";
 import { maskProxyEndpoint, validateProxy } from "./lib/proxy.js";
-import { buildProbeUrl, failureCodeFromName, probeTokenFromUrl } from "./lib/probe-target.js";
+import { buildProbeUrls, failureCodeFromName, isProxyLevelCode, probeTokenFromUrl } from "./lib/probe-target.js";
 import { applyConfig, commitConfig, invalidateConfigCache, loadConfig, recordError, STORAGE_KEY } from "./store.js";
 
 const ERROR_PAGE = "proxy-error.html";
 const PROBE_KEY = "probe";
+const PROBE_TIMEOUT_MS = 8000;
 const GREEN = "#188038";
 const RED = "#d93025";
 
@@ -113,33 +114,62 @@ export function isProbeActive() {
   return probeState !== null;
 }
 
+function probeHostMatches(url) {
+  if (!probeState) return false;
+  if (probeTokenFromUrl(url) === probeState.token) return true;
+  const host = hostFromUrl(url);
+  return Boolean(host) && (host === probeState.host || host.endsWith("." + probeState.host));
+}
+
 export function recordProbeError(details) {
   if (!probeState || !details) return;
-  if (probeTokenFromUrl(details.url) !== probeState.token) return;
-  if (!probeState.errorCode) probeState.errorCode = details.error || "";
+  if (!probeHostMatches(details.url)) return;
+  const code = readErrorCode(details.error || "");
+  if (!code) return;
+  if (!probeState.errorCode || isProxyLevelCode(code)) probeState.errorCode = code;
 }
 
 function probeReason(code, endpoint) {
-  return (
-    describeProxyError(code, { endpoint }) || {
-      code: code || "ERR_PROXY_CONNECTION_FAILED",
-      title: "Прокси недоступен",
-      detail: `Не удалось установить соединение через прокси ${endpoint}.`
-    }
-  );
+  const known = describeProxyError(code, { endpoint });
+  if (known) return known;
+  return {
+    code: code || "ERR_PROXY_CONNECTION_FAILED",
+    title: "Не удалось проверить прокси",
+    detail: code
+      ? `Запрос через прокси ${endpoint} завершился ошибкой ${code}.`
+      : `Запрос через прокси ${endpoint} не удался.`
+  };
 }
 
 async function restoreAfterProbe() {
-  const config = await loadConfig();
-  await applyConfig(config);
-  await chrome.storage.local.remove(PROBE_KEY).catch(() => {});
-  probeState = null;
+  try {
+    const config = await loadConfig();
+    await applyConfig(config);
+  } finally {
+    await chrome.storage.local.remove(PROBE_KEY).catch(() => {});
+    probeState = null;
+  }
 }
 
-export async function startProbe(candidate) {
+async function fetchProbeUrl(url, timeoutMs) {
+  await fetch(url, {
+    mode: "no-cors",
+    cache: "no-store",
+    credentials: "omit",
+    signal: AbortSignal.timeout(timeoutMs)
+  });
+}
+
+/**
+ * Проверяет доступ к прокси так же, как работает реальный браузинг: HTTPS через
+ * CONNECT. Обычный HTTP-запрос даёт ложные сбои на прокси, разрешающих только 443.
+ * Запрос выполняется в service worker: один вызов, без гонки между страницей и
+ * воркером, с гарантированным восстановлением настроек в finally.
+ */
+export async function probeProxy(candidate, options = {}) {
   const validationError = validateProxy(candidate);
   if (validationError) {
-    return { ok: false, reason: { code: "", title: "Прокси не сохранён", detail: validationError } };
+    return { ok: false, reason: { code: "", title: "Прокси не проверен", detail: validationError } };
   }
   if (probeState) {
     return {
@@ -148,9 +178,19 @@ export async function startProbe(candidate) {
     };
   }
 
+  const timeoutMs = Number(options.timeoutMs) || PROBE_TIMEOUT_MS;
   const config = await loadConfig();
   const token = crypto.randomUUID();
-  probeState = { token, errorCode: "", endpoint: maskProxyEndpoint(candidate), proxy: candidate };
+  const endpoint = maskProxyEndpoint(candidate);
+  const urls = buildProbeUrls(config.domains, token);
+
+  probeState = {
+    token,
+    host: hostFromUrl(urls[0]),
+    errorCode: "",
+    endpoint,
+    proxy: candidate
+  };
 
   try {
     await chrome.storage.local.set({ [PROBE_KEY]: token });
@@ -170,25 +210,30 @@ export async function startProbe(candidate) {
     return { ok: false, reason: { code: "", title: "Не удалось включить прокси", detail: message } };
   }
 
-  return {
-    ok: true,
-    token,
-    url: buildProbeUrl(config.domains, token),
-    endpoint: probeState.endpoint
-  };
-}
+  let code = "";
+  let succeededUrl = "";
 
-export async function finishProbe({ token, fetchFailed, failureName, errorCode } = {}) {
-  const active = probeState;
-  const captured = active && active.token === token ? active.errorCode : "";
-  const code = readErrorCode(captured) || readErrorCode(errorCode) || (fetchFailed ? failureCodeFromName(failureName) : "");
-  const endpoint = (active && active.endpoint) || maskProxyEndpoint((await loadConfig()).proxy);
+  try {
+    for (const url of urls) {
+      probeState.errorCode = "";
+      probeState.host = hostFromUrl(url);
+      try {
+        await fetchProbeUrl(url, timeoutMs);
+        succeededUrl = url;
+        break;
+      } catch (error) {
+        const captured = readErrorCode(probeState.errorCode);
+        const failureName = (error && error.name) || "";
+        code = captured || failureCodeFromName(failureName) || "ERR_PROXY_CONNECTION_FAILED";
+        if (isProxyLevelCode(code) && code !== "ERR_PROXY_AUTH_UNSUPPORTED") break;
+      }
+    }
+  } finally {
+    await restoreAfterProbe();
+  }
 
-  await restoreAfterProbe();
-
-  if (!fetchFailed && !captured) return { ok: true, code: "" };
-
-  return { ok: false, code: code || "ERR_PROXY_CONNECTION_FAILED", reason: probeReason(code, endpoint || "прокси") };
+  if (succeededUrl) return { ok: true, endpoint, url: succeededUrl, code: "" };
+  return { ok: false, code, reason: probeReason(code, endpoint) };
 }
 
 chrome.action.onClicked.addListener((tab) => handleToggle(tab));
@@ -236,22 +281,12 @@ chrome.webRequest.onErrorOccurred.addListener(
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (!message || typeof message !== "object") return false;
+  if (message.type !== "probe") return false;
 
-  if (message.type === "probe-start") {
-    startProbe(message.proxy).then(sendResponse, (error) =>
-      sendResponse({ ok: false, reason: { code: "", title: "Проверка не выполнена", detail: String(error) } })
-    );
-    return true;
-  }
-
-  if (message.type === "probe-finish") {
-    finishProbe(message).then(sendResponse, (error) =>
-      sendResponse({ ok: false, reason: { code: "", title: "Проверка не выполнена", detail: String(error) } })
-    );
-    return true;
-  }
-
-  return false;
+  probeProxy(message.proxy, { timeoutMs: message.timeoutMs }).then(sendResponse, (error) =>
+    sendResponse({ ok: false, reason: { code: "", title: "Проверка не выполнена", detail: String(error) } })
+  );
+  return true;
 });
 
 chrome.webRequest.onCompleted.addListener(

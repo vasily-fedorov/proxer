@@ -168,155 +168,219 @@ test("badge не показывает ON, если домен в списке, �
   assert.match(titles.at(-1).title, /прокси не настроен/);
 });
 
-test("startProbe ставит fixed_servers на проверяемый прокси и возвращает цель", async () => {
+const probeCandidate = { scheme: "http", host: "10.0.0.9", port: 3128, username: "", password: "" };
+
+function stubFetch(outcome) {
+  const calls = [];
+  const saved = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url, init });
+    if (typeof outcome === "function") return outcome(url, calls.length);
+    if (outcome instanceof Error) throw outcome;
+    return { ok: true, type: "opaque" };
+  };
+  return { calls, restore: () => { globalThis.fetch = saved; } };
+}
+
+test("probeProxy проверяет первый сайт по HTTPS через fixed_servers и восстанавливает PAC", async () => {
   const env = await loadBackground({ version: 1, proxy, domains: ["target.test"], lastError: null });
-  const result = await env.mod.startProbe({ scheme: "http", host: "10.0.0.9", port: 3128, username: "", password: "" });
+  const fetcher = stubFetch(null);
+  try {
+    const result = await env.mod.probeProxy(probeCandidate);
 
-  assert.equal(result.ok, true);
-  assert.equal(result.endpoint, "10.0.0.9:3128");
-  assert.match(result.url, /^http:\/\/target\.test\/\?proxer_probe=/);
-  assert.equal(env.mod.isProbeActive(), true);
+    assert.equal(result.ok, true);
+    assert.equal(result.endpoint, "10.0.0.9:3128");
+    assert.match(fetcher.calls[0].url, /^https:\/\/target\.test\/\?proxer_probe=/);
 
-  const [call] = env.stub.calls.set;
-  assert.equal(call.value.mode, "fixed_servers");
-  assert.deepEqual(call.value.rules.singleProxy, { scheme: "http", host: "10.0.0.9", port: 3128 });
-  assert.equal(env.stub.storage.get("probe"), result.token);
+    const [fixed, restored] = env.stub.calls.set;
+    assert.equal(fixed.value.mode, "fixed_servers");
+    assert.deepEqual(fixed.value.rules.singleProxy, { scheme: "http", host: "10.0.0.9", port: 3128 });
+    assert.equal(restored.value.mode, "pac_script");
+
+    assert.equal(env.mod.isProbeActive(), false);
+    assert.equal(env.stub.storage.has("probe"), false);
+  } finally {
+    fetcher.restore();
+  }
 });
 
-test("startProbe берёт example.com при пустом списке и socks5-схему", async () => {
-  const env = await loadBackground({ version: 1, proxy, domains: [], lastError: null });
-  const result = await env.mod.startProbe({ scheme: "socks5", host: "10.0.0.9", port: 1080, username: "", password: "" });
+test("probeProxy падает на закрытом прокси и возвращает PAC обратно", async () => {
+  const env = await loadBackground({ version: 1, proxy, domains: ["target.test"], lastError: null });
+  const fetcher = stubFetch(() => {
+    env.mod.recordProbeError({ url: "https://target.test/?proxer_probe=", error: "net::ERR_PROXY_CONNECTION_FAILED" });
+    throw new TypeError("Failed to fetch");
+  });
+  try {
+    const result = await env.mod.probeProxy(probeCandidate);
 
-  assert.equal(result.ok, true);
-  assert.match(result.url, /^http:\/\/example\.com\/\?proxer_probe=/);
-  const [call] = env.stub.calls.set;
-  assert.equal(call.value.rules.singleProxy.scheme, "socks5");
+    assert.equal(result.ok, false);
+    assert.equal(result.code, "ERR_PROXY_CONNECTION_FAILED");
+    assert.match(result.reason.detail, /10\.0\.0\.9:3128/);
+
+    const last = env.stub.calls.set.at(-1);
+    assert.equal(last.value.mode, "pac_script");
+  } finally {
+    fetcher.restore();
+  }
 });
 
-test("startProbe отклоняет некорректный прокси и не трогает настройки браузера", async () => {
-  const env = await loadBackground({ version: 1, proxy, domains: ["example.com"], lastError: null });
-  const result = await env.mod.startProbe({ scheme: "socks5", host: "10.0.0.9", port: 1080, username: "u", password: "p" });
+test("probeProxy ловит ошибку по хосту даже если redirect потерял маркер", async () => {
+  const env = await loadBackground({ version: 1, proxy, domains: ["target.test"], lastError: null });
+  const fetcher = stubFetch(() => {
+    env.mod.recordProbeError({ url: "https://www.target.test/", error: "net::ERR_TUNNEL_CONNECTION_FAILED" });
+    throw new TypeError("Failed to fetch");
+  });
+  try {
+    const result = await env.mod.probeProxy(probeCandidate);
+    assert.equal(result.code, "ERR_TUNNEL_CONNECTION_FAILED");
+  } finally {
+    fetcher.restore();
+  }
+});
+
+test("probeProxy переходит на нейтральный хост, если сайт из списка не отвечает", async () => {
+  const env = await loadBackground({ version: 1, proxy, domains: ["broken.test"], lastError: null });
+  let call = 0;
+  const fetcher = stubFetch(() => {
+    call += 1;
+    if (call === 1) {
+      env.mod.recordProbeError({ url: "https://broken.test/?proxer_probe=x", error: "net::ERR_CERT_AUTHORITY_INVALID" });
+      throw new TypeError("Failed to fetch");
+    }
+    return { ok: true, type: "opaque" };
+  });
+  try {
+    const result = await env.mod.probeProxy(probeCandidate);
+    assert.equal(result.ok, true);
+    assert.match(fetcher.calls[0].url, /broken\.test/);
+    assert.match(fetcher.calls[1].url, /example\.com/);
+  } finally {
+    fetcher.restore();
+  }
+});
+
+test("probeProxy не пытается обойти сбой прокси вторым хостом", async () => {
+  const env = await loadBackground({ version: 1, proxy, domains: ["target.test"], lastError: null });
+  const fetcher = stubFetch(() => {
+    env.mod.recordProbeError({ url: "https://target.test/?proxer_probe=x", error: "net::ERR_PROXY_CONNECTION_FAILED" });
+    throw new TypeError("Failed to fetch");
+  });
+  try {
+    const result = await env.mod.probeProxy(probeCandidate);
+    assert.equal(result.ok, false);
+    assert.equal(fetcher.calls.length, 1, "после сбоя прокси второй хост не нужен");
+  } finally {
+    fetcher.restore();
+  }
+});
+
+test("probeProxy переводит таймаут в понятную причину", async () => {
+  const env = await loadBackground({ version: 1, proxy, domains: ["target.test"], lastError: null });
+  const fetcher = stubFetch(() => {
+    const error = new Error("timeout");
+    error.name = "TimeoutError";
+    throw error;
+  });
+  try {
+    const result = await env.mod.probeProxy(probeCandidate);
+    assert.equal(result.ok, false);
+    assert.equal(result.code, "ERR_CONNECTION_TIMED_OUT");
+    assert.match(result.reason.title, /не ответил/i);
+  } finally {
+    fetcher.restore();
+  }
+});
+
+test("probeProxy отклоняет некорректный прокси и не трогает настройки браузера", async () => {
+  const env = await loadBackground({ version: 1, proxy, domains: ["target.test"], lastError: null });
+  const result = await env.mod.probeProxy({ scheme: "socks5", host: "10.0.0.9", port: 1080, username: "u", password: "p" });
 
   assert.equal(result.ok, false);
   assert.match(result.reason.detail, /SOCKS5/);
   assert.equal(env.stub.calls.set.length, 0);
-  assert.equal(env.mod.isProbeActive(), false);
 });
 
-test("startProbe не запускает вторую проверку параллельно", async () => {
-  const env = await loadBackground({ version: 1, proxy, domains: ["example.com"], lastError: null });
-  const candidate = { scheme: "http", host: "10.0.0.9", port: 3128, username: "", password: "" };
+test("probeProxy не запускает вторую проверку параллельно", async () => {
+  const env = await loadBackground({ version: 1, proxy, domains: ["target.test"], lastError: null });
+  let release;
+  const fetcher = stubFetch(() => new Promise((resolve) => { release = () => resolve({ ok: true }); }));
+  try {
+    const running = env.mod.probeProxy(probeCandidate);
+    await new Promise((resolve) => setTimeout(resolve, 0));
 
-  assert.equal((await env.mod.startProbe(candidate)).ok, true);
-  const second = await env.mod.startProbe(candidate);
-  assert.equal(second.ok, false);
-  assert.match(second.reason.title, /уже идёт/);
+    const second = await env.mod.probeProxy(probeCandidate);
+    assert.equal(second.ok, false);
+    assert.match(second.reason.title, /уже идёт/);
+
+    release();
+    assert.equal((await running).ok, true);
+  } finally {
+    fetcher.restore();
+  }
 });
 
-test("finishProbe при успехе возвращает PAC и снимает флаг", async () => {
-  const env = await loadBackground({ version: 1, proxy, domains: ["example.com"], lastError: null });
-  const started = await env.mod.startProbe({ scheme: "http", host: "10.0.0.9", port: 3128, username: "", password: "" });
+test("во время проверки onAuthRequired отдаёт креды проверяемого прокси", async () => {
+  const env = await loadBackground({ version: 1, proxy, domains: ["target.test"], lastError: null });
+  let release;
+  const fetcher = stubFetch(() => new Promise((resolve) => { release = () => resolve({ ok: true }); }));
+  try {
+    const running = env.mod.probeProxy({ ...probeCandidate, username: "probe-user", password: "probe-pass" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
 
-  const result = await env.mod.finishProbe({ token: started.token, fetchFailed: false });
-  assert.equal(result.ok, true);
-  assert.equal(env.mod.isProbeActive(), false);
+    const ask = (details) => new Promise((resolve) => env.listeners.auth.fn(details, resolve));
+    assert.deepEqual(await ask({ isProxy: true, url: "https://target.test/" }), {
+      authCredentials: { username: "probe-user", password: "probe-pass" }
+    });
 
-  const last = env.stub.calls.set.at(-1);
-  assert.equal(last.value.mode, "pac_script");
-  assert.equal(env.stub.storage.has("probe"), false);
-});
-
-test("finishProbe при провале отдаёт причину по коду из webRequest и возвращает PAC", async () => {
-  const env = await loadBackground({
-    version: 1,
-    proxy: { ...proxy, username: "user", password: "s3cret" },
-    domains: ["example.com"],
-    lastError: null
-  });
-  const started = await env.mod.startProbe({ scheme: "http", host: "10.0.0.9", port: 3128, username: "user", password: "s3cret" });
-
-  env.mod.recordProbeError({ url: started.url, error: "net::ERR_PROXY_CONNECTION_FAILED" });
-  const result = await env.mod.finishProbe({ token: started.token, fetchFailed: true });
-
-  assert.equal(result.ok, false);
-  assert.equal(result.code, "ERR_PROXY_CONNECTION_FAILED");
-  assert.match(result.reason.detail, /10\.0\.0\.9:3128/);
-  assert.equal(result.reason.detail.includes("s3cret"), false);
-
-  const last = env.stub.calls.set.at(-1);
-  assert.equal(last.value.mode, "pac_script");
-});
-
-test("recordProbeError игнорирует чужие URL", async () => {
-  const env = await loadBackground({ version: 1, proxy, domains: ["example.com"], lastError: null });
-  await env.mod.startProbe({ scheme: "http", host: "10.0.0.9", port: 3128, username: "", password: "" });
-
-  env.mod.recordProbeError({ url: "https://example.com/", error: "net::ERR_PROXY_CONNECTION_FAILED" });
-  const result = await env.mod.finishProbe({ token: "", fetchFailed: false });
-  assert.equal(result.ok, true);
-});
-
-test("finishProbe переводит таймаут fetch в понятную причину", async () => {
-  const env = await loadBackground({ version: 1, proxy, domains: ["example.com"], lastError: null });
-  const started = await env.mod.startProbe({ scheme: "http", host: "10.0.0.9", port: 3128, username: "", password: "" });
-
-  const result = await env.mod.finishProbe({ token: started.token, fetchFailed: true, failureName: "TimeoutError" });
-  assert.equal(result.ok, false);
-  assert.equal(result.code, "ERR_CONNECTION_TIMED_OUT");
-  assert.match(result.reason.title, /не ответил/i);
+    release();
+    await running;
+    assert.deepEqual(await ask({ isProxy: true, url: "https://target.test/" }), {});
+  } finally {
+    fetcher.restore();
+  }
 });
 
 test("во время проверки сбои других вкладок не уводят их на страницу ошибки", async () => {
   const env = await loadBackground({ version: 1, proxy, domains: ["example.com"], lastError: null });
-  await env.mod.startProbe({ scheme: "http", host: "10.0.0.9", port: 3128, username: "", password: "" });
+  let release;
+  const fetcher = stubFetch(() => new Promise((resolve) => { release = () => resolve({ ok: true }); }));
+  try {
+    const running = env.mod.probeProxy(probeCandidate);
+    await new Promise((resolve) => setTimeout(resolve, 0));
 
-  await env.listeners.error[0]({
-    tabId: 5,
-    type: "main_frame",
-    url: "https://example.com/",
-    error: "net::ERR_PROXY_CONNECTION_FAILED"
-  });
-  assert.equal(env.updates.length, 0);
+    await env.listeners.error[0]({
+      tabId: 5,
+      type: "main_frame",
+      url: "https://example.com/",
+      error: "net::ERR_PROXY_CONNECTION_FAILED"
+    });
+    assert.equal(env.updates.length, 0);
 
-  await env.mod.finishProbe({ token: "", fetchFailed: false });
-  await env.listeners.error[0]({
-    tabId: 5,
-    type: "main_frame",
-    url: "https://example.com/",
-    error: "net::ERR_PROXY_CONNECTION_FAILED"
-  });
-  assert.equal(env.updates.length, 1);
+    release();
+    await running;
+
+    await env.listeners.error[0]({
+      tabId: 5,
+      type: "main_frame",
+      url: "https://example.com/",
+      error: "net::ERR_PROXY_CONNECTION_FAILED"
+    });
+    assert.equal(env.updates.length, 1);
+  } finally {
+    fetcher.restore();
+  }
 });
 
-test("onMessage обрабатывает probe-start и probe-finish", async () => {
-  const env = await loadBackground({ version: 1, proxy, domains: ["example.com"], lastError: null });
-
-  const startResponse = await new Promise((resolve) =>
-    env.listeners.message(
-      { type: "probe-start", proxy: { scheme: "http", host: "10.0.0.9", port: 3128, username: "", password: "" } },
-      {},
-      resolve
-    )
-  );
-  assert.equal(startResponse.ok, true);
-
-  const finishResponse = await new Promise((resolve) =>
-    env.listeners.message({ type: "probe-finish", token: startResponse.token, fetchFailed: false }, {}, resolve)
-  );
-  assert.equal(finishResponse.ok, true);
-  assert.equal(env.listeners.message({ type: "unknown" }, {}, () => {}), false);
-});
-
-test("во время проверки onAuthRequired отдаёт креды проверяемого прокси", async () => {
-  const env = await loadBackground({ version: 1, proxy, domains: ["example.com"], lastError: null });
-  await env.mod.startProbe({ scheme: "http", host: "10.0.0.9", port: 3128, username: "probe-user", password: "probe-pass" });
-
-  const ask = (details) => new Promise((resolve) => env.listeners.auth.fn(details, resolve));
-  assert.deepEqual(await ask({ isProxy: true, url: "http://example.com/?proxer_probe=x" }), {
-    authCredentials: { username: "probe-user", password: "probe-pass" }
-  });
-
-  await env.mod.finishProbe({ token: "", fetchFailed: false });
-
-  assert.deepEqual(await ask({ isProxy: true, url: "http://example.com/" }), {});
+test("onMessage обрабатывает только сообщение probe", async () => {
+  const env = await loadBackground({ version: 1, proxy, domains: ["target.test"], lastError: null });
+  const fetcher = stubFetch(null);
+  try {
+    const response = await new Promise((resolve) =>
+      env.listeners.message({ type: "probe", proxy: probeCandidate }, {}, resolve)
+    );
+    assert.equal(response.ok, true);
+    assert.equal(env.listeners.message({ type: "unknown" }, {}, () => {}), false);
+  } finally {
+    fetcher.restore();
+  }
 });
