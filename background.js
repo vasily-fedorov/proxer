@@ -30,6 +30,15 @@ export async function updateBadge(tab) {
   const config = await loadConfig();
   const rule = findCoveringRule(config.domains, host);
 
+  if (rule && !config.proxy) {
+    await chrome.action.setBadgeText({ tabId: tab.id, text: "" });
+    await chrome.action.setTitle({
+      tabId: tab.id,
+      title: `Сайт ${host} в списке, но прокси не настроен — откройте настройки Proxer`
+    });
+    return;
+  }
+
   if (rule) {
     await chrome.action.setBadgeText({ tabId: tab.id, text: "ON" });
     await chrome.action.setBadgeBackgroundColor({ tabId: tab.id, color: GREEN });
@@ -149,7 +158,8 @@ chrome.tabs.onActivated.addListener(async ({ tabId }) => {
 });
 
 chrome.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
-  if (changeInfo.status === "complete") void updateBadge(tab);
+  if (changeInfo.status !== "complete") return undefined;
+  return updateBadge(tab);
 });
 
 chrome.storage.onChanged.addListener((changes, area) => {

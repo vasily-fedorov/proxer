@@ -5,7 +5,7 @@ import { createChromeStub } from "./helpers/chrome-stub.js";
 function createBackgroundChrome(initialConfig) {
   const stub = createChromeStub({ config: initialConfig });
   stub.tabUrl = "http://example.com/";
-  const listeners = { clicked: [], command: [], auth: null, error: [] };
+  const listeners = { clicked: [], command: [], auth: null, error: [], tabUpdated: [] };
   const badges = [];
   const reloads = [];
   const updates = [];
@@ -20,7 +20,7 @@ function createBackgroundChrome(initialConfig) {
     commands: { onCommand: { addListener: (fn) => listeners.command.push(fn) } },
     tabs: {
       onActivated: { addListener: () => {} },
-      onUpdated: { addListener: () => {} },
+      onUpdated: { addListener: (fn) => listeners.tabUpdated.push(fn) },
       async reload(tabId) {
         reloads.push(tabId);
       },
@@ -154,4 +154,15 @@ test("onErrorOccurred не зацикливается, если вкладка �
 
   await env.listeners.error[0]({ tabId: 5, type: "main_frame", url: "https://example.com/", error: "net::ERR_PROXY_CONNECTION_FAILED" });
   assert.equal(env.updates.length, 0);
+});
+
+test("badge не показывает ON, если домен в списке, а прокси не настроен", async () => {
+  const env = await loadBackground({ version: 1, proxy: null, domains: ["example.com"], lastError: null });
+  await env.listeners.tabUpdated[0](7, { status: "complete" }, { id: 7, url: "https://example.com/" });
+
+  const texts = env.badges.filter((badge) => badge.type === "text" && badge.tabId === 7);
+  assert.equal(texts.at(-1).text, "");
+
+  const titles = env.badges.filter((badge) => badge.type === "title" && badge.tabId === 7);
+  assert.match(titles.at(-1).title, /прокси не настроен/);
 });
