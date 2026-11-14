@@ -103,8 +103,6 @@ async function renderControl() {
 
 schemeSelect.addEventListener("change", syncSchemeFields);
 
-const PROBE_TIMEOUT_MS = 10000;
-
 const saveProxyButton = $("save-proxy");
 const checkProxyButton = $("check-proxy");
 
@@ -120,34 +118,15 @@ function setProbeBusy(busy) {
 }
 
 async function runProbe(candidate) {
-  const started = await chrome.runtime.sendMessage({ type: "probe-start", proxy: candidate });
-  if (!started || !started.ok) {
-    return { ok: false, error: formatReason(started && started.reason) };
-  }
-
-  let fetchFailed = false;
-  let failureName = "";
+  let response;
   try {
-    await fetch(started.url, {
-      mode: "no-cors",
-      cache: "no-store",
-      credentials: "omit",
-      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS)
-    });
+    response = await chrome.runtime.sendMessage({ type: "probe", proxy: candidate });
   } catch (error) {
-    fetchFailed = true;
-    failureName = (error && error.name) || "";
+    return { ok: false, error: `Не удалось запустить проверку: ${error && error.message ? error.message : error}` };
   }
 
-  const finished = await chrome.runtime.sendMessage({
-    type: "probe-finish",
-    token: started.token,
-    fetchFailed,
-    failureName
-  });
-
-  if (finished && finished.ok) return { ok: true, endpoint: started.endpoint };
-  return { ok: false, error: formatReason(finished && finished.reason), code: finished && finished.code };
+  if (response && response.ok) return { ok: true, endpoint: response.endpoint };
+  return { ok: false, error: formatReason(response && response.reason), code: response && response.code };
 }
 
 function currentFormPatch() {
