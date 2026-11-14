@@ -5,8 +5,21 @@ export function createChromeStub(initial = {}) {
   let setErrorTimes = 0;
   let levelOfControl = "controllable_by_this_extension";
 
+  const session = new Map();
+
   const chrome = {
     storage: {
+      session: {
+        async get(key) {
+          return session.has(key) ? { [key]: structuredClone(session.get(key)) } : {};
+        },
+        async set(entries) {
+          for (const [key, value] of Object.entries(entries)) session.set(key, structuredClone(value));
+        },
+        async remove(key) {
+          session.delete(key);
+        }
+      },
       local: {
         async get(key) {
           calls.get += 1;
@@ -44,6 +57,7 @@ export function createChromeStub(initial = {}) {
     chrome,
     calls,
     storage,
+    session,
     failNextSet(message) {
       setError = message;
       setErrorTimes = 1;

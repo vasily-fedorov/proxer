@@ -384,3 +384,171 @@ test("onMessage обрабатывает только сообщение probe",
     fetcher.restore();
   }
 });
+
+test("handleToggle включает домен вместе с профилем популярного сайта", async () => {
+  const env = await loadBackground({ version: 1, proxy, domains: [], lastError: null });
+  await env.listeners.clicked[0]({ id: 9, url: "https://www.youtube.com/watch?v=1" });
+
+  const stored = env.stub.storage.get("config");
+  assert.ok(stored.domains.includes("youtube.com"), "сам сайт должен быть в списке");
+  assert.ok(stored.domains.includes("googlevideo.com"), "медиа-домен профиля должен добавиться");
+  assert.ok(stored.domains.includes("ytimg.com"), "CDN картинок должен добавиться");
+  assert.deepEqual(stored.domains, [...stored.domains].sort());
+});
+
+test("handleToggle выключает сайт и убирает домены профиля", async () => {
+  const env = await loadBackground({
+    version: 1,
+    proxy,
+    domains: ["youtube.com", "googlevideo.com", "ytimg.com", "other.org"],
+    lastError: null
+  });
+  await env.listeners.clicked[0]({ id: 9, url: "https://youtube.com/" });
+
+  const stored = env.stub.storage.get("config");
+  assert.deepEqual(stored.domains, ["other.org"]);
+});
+
+test("для сайта без профиля toggle остаётся прежним", async () => {
+  const env = await loadBackground({ version: 1, proxy, domains: [], lastError: null });
+  await env.listeners.clicked[0]({ id: 2, url: "https://example.com/page" });
+
+  assert.deepEqual(env.stub.storage.get("config").domains, ["example.com"]);
+});
+
+test("recordSuggestion запоминает чужой домен, который грузится напрямую", async () => {
+  const env = await loadBackground({ version: 1, proxy, domains: ["youtube.com"], lastError: null });
+  const added = await env.mod.recordSuggestion({
+    type: "media",
+    tabId: 3,
+    url: "https://rr4---sn-4g5e6nzs.googlevideo.com/videoplayback",
+    initiator: "https://www.youtube.com",
+    error: "net::ERR_CONNECTION_RESET"
+  });
+
+  assert.equal(added, true);
+  assert.deepEqual(env.stub.session.get("suggestions"), [{ site: "youtube.com", domain: "googlevideo.com" }]);
+});
+
+test("recordSuggestion игнорирует main_frame, чужие страницы и шумные коды", async () => {
+  const env = await loadBackground({ version: 1, proxy, domains: ["youtube.com", "ytimg.com"], lastError: null });
+  const base = {
+    type: "image",
+    tabId: 3,
+    url: "https://cdn.other.com/x.png",
+    initiator: "https://www.youtube.com",
+    error: "net::ERR_CONNECTION_RESET"
+  };
+
+  assert.equal(await env.mod.recordSuggestion({ ...base, type: "main_frame" }), false);
+  assert.equal(await env.mod.recordSuggestion({ ...base, initiator: "https://uncovered.example" }), false);
+  assert.equal(await env.mod.recordSuggestion({ ...base, error: "net::ERR_ABORTED" }), false);
+  assert.equal(await env.mod.recordSuggestion({ ...base, url: "https://ytimg.com/x.png", error: "net::ERR_CONNECTION_RESET" }), false);
+  assert.deepEqual(env.stub.session.get("suggestions"), undefined);
+});
+
+test("recordSuggestion молчит, когда прокси не настроен", async () => {
+  const env = await loadBackground({ version: 1, proxy: null, domains: ["youtube.com"], lastError: null });
+  assert.equal(
+    await env.mod.recordSuggestion({
+      type: "image",
+      tabId: 3,
+      url: "https://cdn.other.com/x.png",
+      initiator: "https://www.youtube.com",
+      error: "net::ERR_CONNECTION_RESET"
+    }),
+    false
+  );
+});
+
+test("badge показывает +N, когда часть доменов идёт напрямую", async () => {
+  const env = await loadBackground({ version: 1, proxy, domains: ["youtube.com"], lastError: null });
+  await env.mod.recordSuggestion({
+    type: "media",
+    tabId: 7,
+    url: "https://rr4.googlevideo.com/videoplayback",
+    initiator: "https://www.youtube.com",
+    error: "net::ERR_CONNECTION_RESET"
+  });
+  await env.mod.recordSuggestion({
+    type: "image",
+    tabId: 7,
+    url: "https://i.ytimg.com/vi/1.jpg",
+    initiator: "https://www.youtube.com",
+    error: "net::ERR_CONNECTION_RESET"
+  });
+
+  await env.listeners.tabUpdated[0](7, { status: "complete" }, { id: 7, url: "https://www.youtube.com/watch" });
+
+  const texts = env.badges.filter((badge) => badge.type === "text" && badge.tabId === 7);
+  assert.equal(texts.at(-1).text, "+2");
+  const colors = env.badges.filter((badge) => badge.type === "color" && badge.tabId === 7);
+  assert.equal(colors.at(-1).color, "#f29900");
+});
+
+test("applySuggestion добавляет домен в конфиг и убирает подсказку", async () => {
+  const env = await loadBackground({ version: 1, proxy, domains: ["youtube.com"], lastError: null });
+  await env.mod.recordSuggestion({
+    type: "media",
+    tabId: 3,
+    url: "https://rr4.googlevideo.com/x",
+    initiator: "https://www.youtube.com",
+    error: "net::ERR_CONNECTION_RESET"
+  });
+
+  const result = await env.mod.applySuggestion({ site: "youtube.com", domain: "googlevideo.com" });
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.suggestions, []);
+
+  const stored = env.stub.storage.get("config");
+  assert.ok(stored.domains.includes("googlevideo.com"));
+  assert.equal(env.stub.calls.set.at(-1).value.mode, "pac_script");
+});
+
+test("ignoreSuggestion убирает подсказку, не меняя конфиг", async () => {
+  const env = await loadBackground({ version: 1, proxy, domains: ["youtube.com"], lastError: null });
+  await env.mod.recordSuggestion({
+    type: "image",
+    tabId: 3,
+    url: "https://i.ytimg.com/x.png",
+    initiator: "https://www.youtube.com",
+    error: "net::ERR_CONNECTION_RESET"
+  });
+
+  const result = await env.mod.ignoreSuggestion({ site: "youtube.com", domain: "ytimg.com" });
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.suggestions, []);
+  assert.deepEqual(env.stub.storage.get("config").domains, ["youtube.com"]);
+});
+
+test("сообщения suggestions-list, suggestion-apply и suggestion-ignore работают", async () => {
+  const env = await loadBackground({ version: 1, proxy, domains: ["youtube.com"], lastError: null });
+  await env.mod.recordSuggestion({
+    type: "image",
+    tabId: 3,
+    url: "https://i.ytimg.com/x.png",
+    initiator: "https://www.youtube.com",
+    error: "net::ERR_CONNECTION_RESET"
+  });
+
+  const ask = (message) => new Promise((resolve) => env.listeners.message(message, {}, resolve));
+
+  const listed = await ask({ type: "suggestions-list" });
+  assert.equal(listed.ok, true);
+  assert.equal(listed.suggestions.length, 1);
+
+  const applied = await ask({ type: "suggestion-apply", site: "youtube.com", domain: "ytimg.com" });
+  assert.equal(applied.ok, true);
+
+  await env.mod.recordSuggestion({
+    type: "image",
+    tabId: 3,
+    url: "https://i.ytimg.com/x.png",
+    initiator: "https://www.youtube.com",
+    error: "net::ERR_CONNECTION_RESET"
+  }).catch(() => {});
+
+  const ignored = await ask({ type: "suggestion-ignore", site: "youtube.com", domain: "ytimg.com" });
+  assert.equal(ignored.ok, true);
+  assert.equal(env.listeners.message({ type: "unknown" }, {}, () => {}), false);
+});

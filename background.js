@@ -2,13 +2,22 @@ import { findCoveringRule, normalizeDomain, toggleDomain } from "./lib/domains.j
 import { describeProxyError, readErrorCode } from "./lib/errors.js";
 import { maskProxyEndpoint, validateProxy } from "./lib/proxy.js";
 import { buildProbeUrls, failureCodeFromName, isProxyLevelCode, probeTokenFromUrl } from "./lib/probe-target.js";
+import { expandDomains, profileFor } from "./lib/profiles.js";
+import {
+  addSuggestion,
+  pruneSuggestions,
+  suggestionFor,
+  suggestionCountFor
+} from "./lib/suggestions.js";
 import { applyConfig, commitConfig, invalidateConfigCache, loadConfig, recordError, STORAGE_KEY } from "./store.js";
 
 const ERROR_PAGE = "proxy-error.html";
 const PROBE_KEY = "probe";
 const PROBE_TIMEOUT_MS = 8000;
+const SUGGESTIONS_KEY = "suggestions";
 const GREEN = "#188038";
 const RED = "#d93025";
+const AMBER = "#f29900";
 
 let probeState = null;
 
@@ -21,6 +30,67 @@ export function hostFromUrl(url) {
   } catch {
     return "";
   }
+}
+
+export function removeProfileDomains(domains, host) {
+  const profile = profileFor(host);
+  if (!profile) return domains;
+  const drop = new Set(profile.domains);
+  return domains.filter((domain) => !drop.has(domain));
+}
+
+export async function loadSuggestions() {
+  const store = chrome.storage.session || chrome.storage.local;
+  const stored = await store.get(SUGGESTIONS_KEY).catch(() => ({}));
+  const config = await loadConfig();
+  return pruneSuggestions(stored ? stored[SUGGESTIONS_KEY] : [], config.domains);
+}
+
+async function saveSuggestions(list) {
+  const store = chrome.storage.session || chrome.storage.local;
+  await store.set({ [SUGGESTIONS_KEY]: list });
+}
+
+export async function recordSuggestion(details) {
+  if (!details || details.type === "main_frame") return false;
+  if (probeState) return false;
+
+  const pageHost = hostFromUrl(details.initiator || details.documentUrl || "");
+  if (!pageHost) return false;
+
+  const config = await loadConfig();
+  if (!config.proxy) return false;
+
+  const domain = suggestionFor({ error: details.error, url: details.url, pageHost, domains: config.domains });
+  if (!domain) return false;
+
+  const current = await loadSuggestions();
+  const next = addSuggestion(current, { site: pageHost, domain });
+  if (next === current) return false;
+
+  await saveSuggestions(next);
+  return true;
+}
+
+export async function applySuggestion({ site, domain }) {
+  if (typeof site !== "string" || typeof domain !== "string" || !site || !domain) {
+    return { ok: false, error: "bad-request" };
+  }
+
+  const config = await loadConfig();
+  const domains = [...new Set([...config.domains, domain])].sort();
+  const result = await commitConfig({ ...config, domains });
+  if (!result.ok) return { ok: false, error: result.error };
+
+  const next = (await loadSuggestions()).filter((item) => !(item.site === site && item.domain === domain));
+  await saveSuggestions(next);
+  return { ok: true, suggestions: next };
+}
+
+export async function ignoreSuggestion({ site, domain }) {
+  const next = (await loadSuggestions()).filter((item) => !(item.site === site && item.domain === domain));
+  await saveSuggestions(next);
+  return { ok: true, suggestions: next };
 }
 
 export async function updateBadge(tab) {
@@ -45,11 +115,30 @@ export async function updateBadge(tab) {
   }
 
   if (rule) {
+    const suggestions = await loadSuggestions();
+    const pending = suggestionCountFor(suggestions, host);
+    const profile = profileFor(host);
+
+    if (pending > 0) {
+      const domains = suggestions
+        .filter((item) => item.site === host || host.endsWith(`.${item.site}`))
+        .map((item) => item.domain)
+        .join(", ");
+      await chrome.action.setBadgeText({ tabId: tab.id, text: `+${pending}` });
+      await chrome.action.setBadgeBackgroundColor({ tabId: tab.id, color: AMBER });
+      await chrome.action.setTitle({
+        tabId: tab.id,
+        title: `Прокси включён, но ${pending} домен(ов) грузятся напрямую: ${domains}. Откройте настройки Proxer`
+      });
+      return;
+    }
+
     await chrome.action.setBadgeText({ tabId: tab.id, text: "ON" });
     await chrome.action.setBadgeBackgroundColor({ tabId: tab.id, color: GREEN });
+    const profileNote = profile ? ` · профиль: ${profile.domains.length} домен(ов)` : "";
     await chrome.action.setTitle({
       tabId: tab.id,
-      title: `Прокси включён: ${host} → ${maskProxyEndpoint(config.proxy)} (правило ${rule})`
+      title: `Прокси включён: ${host} → ${maskProxyEndpoint(config.proxy)} (правило ${rule})${profileNote}`
     });
     return;
   }
@@ -66,7 +155,12 @@ export async function handleToggle(tab) {
 
   const config = await loadConfig();
   const wasCovered = Boolean(findCoveringRule(config.domains, host));
-  const result = await commitConfig({ ...config, domains: toggleDomain(config.domains, host) });
+  const toggled = toggleDomain(config.domains, host);
+  // При включении сразу подтягиваем домены известного профиля, чтобы видео и CDN
+  // заработали без ручного добавления каждого домена; при выключении — убираем их,
+  // иначе "выключить" не выключало бы трафик сайта.
+  const domains = wasCovered ? removeProfileDomains(toggled, host) : expandDomains(toggled, host);
+  const result = await commitConfig({ ...config, domains });
 
   if (!result.ok) {
     await chrome.action.setBadgeText({ tabId: tab.id, text: "!" });
@@ -272,21 +366,57 @@ chrome.webRequest.onAuthRequired.addListener(
 );
 
 chrome.webRequest.onErrorOccurred.addListener(
-  (details) => {
+  async (details) => {
     recordProbeError(details);
-    return handleProxyFailure(details);
+
+    if (await handleProxyFailure(details)) return;
+
+    if (await recordSuggestion(details)) {
+      if (details.tabId < 0) return;
+      try {
+        const tab = await chrome.tabs.get(details.tabId);
+        if (tab) await updateBadge(tab);
+      } catch {
+        /* вкладка уже закрыта */
+      }
+    }
   },
   { urls: ["<all_urls>"] }
 );
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (!message || typeof message !== "object") return false;
-  if (message.type !== "probe") return false;
 
-  probeProxy(message.proxy, { timeoutMs: message.timeoutMs }).then(sendResponse, (error) =>
-    sendResponse({ ok: false, reason: { code: "", title: "Проверка не выполнена", detail: String(error) } })
-  );
-  return true;
+  if (message.type === "probe") {
+    probeProxy(message.proxy, { timeoutMs: message.timeoutMs }).then(sendResponse, (error) =>
+      sendResponse({ ok: false, reason: { code: "", title: "Проверка не выполнена", detail: String(error) } })
+    );
+    return true;
+  }
+
+  if (message.type === "suggestions-list") {
+    loadSuggestions().then(
+      (suggestions) => sendResponse({ ok: true, suggestions }),
+      (error) => sendResponse({ ok: false, error: String(error), suggestions: [] })
+    );
+    return true;
+  }
+
+  if (message.type === "suggestion-apply") {
+    applySuggestion({ site: message.site, domain: message.domain }).then(sendResponse, (error) =>
+      sendResponse({ ok: false, error: String(error) })
+    );
+    return true;
+  }
+
+  if (message.type === "suggestion-ignore") {
+    ignoreSuggestion({ site: message.site, domain: message.domain }).then(sendResponse, (error) =>
+      sendResponse({ ok: false, error: String(error) })
+    );
+    return true;
+  }
+
+  return false;
 });
 
 chrome.webRequest.onCompleted.addListener(
