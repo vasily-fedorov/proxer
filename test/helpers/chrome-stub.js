@@ -1,6 +1,6 @@
 export function createChromeStub(initial = {}) {
   const storage = new Map(Object.entries(initial));
-  const calls = { set: [], clear: [], get: 0 };
+  const calls = { set: [], clear: [], remove: [], get: 0 };
   let setError = null;
   let setErrorTimes = 0;
   let levelOfControl = "controllable_by_this_extension";
@@ -14,6 +14,10 @@ export function createChromeStub(initial = {}) {
         },
         async set(entries) {
           for (const [key, value] of Object.entries(entries)) storage.set(key, structuredClone(value));
+        },
+        async remove(key) {
+          calls.remove.push(key);
+          storage.delete(key);
         }
       }
     },

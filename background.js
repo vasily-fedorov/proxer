@@ -1,11 +1,15 @@
 import { findCoveringRule, normalizeDomain, toggleDomain } from "./lib/domains.js";
-import { describeProxyError } from "./lib/errors.js";
-import { maskProxyEndpoint } from "./lib/proxy.js";
+import { describeProxyError, readErrorCode } from "./lib/errors.js";
+import { maskProxyEndpoint, validateProxy } from "./lib/proxy.js";
+import { buildProbeUrl, failureCodeFromName, probeTokenFromUrl } from "./lib/probe-target.js";
 import { applyConfig, commitConfig, invalidateConfigCache, loadConfig, recordError, STORAGE_KEY } from "./store.js";
 
 const ERROR_PAGE = "proxy-error.html";
+const PROBE_KEY = "probe";
 const GREEN = "#188038";
 const RED = "#d93025";
+
+let probeState = null;
 
 const isHttpUrl = (value) => typeof value === "string" && /^https?:\/\//i.test(value);
 
@@ -74,6 +78,7 @@ export async function handleToggle(tab) {
 }
 
 export async function handleProxyFailure(details) {
+  if (probeState) return false;
   if (!details || details.tabId < 0 || details.type !== "main_frame") return false;
 
   const config = await loadConfig();
@@ -104,6 +109,88 @@ export async function handleProxyFailure(details) {
   return true;
 }
 
+export function isProbeActive() {
+  return probeState !== null;
+}
+
+export function recordProbeError(details) {
+  if (!probeState || !details) return;
+  if (probeTokenFromUrl(details.url) !== probeState.token) return;
+  if (!probeState.errorCode) probeState.errorCode = details.error || "";
+}
+
+function probeReason(code, endpoint) {
+  return (
+    describeProxyError(code, { endpoint }) || {
+      code: code || "ERR_PROXY_CONNECTION_FAILED",
+      title: "Прокси недоступен",
+      detail: `Не удалось установить соединение через прокси ${endpoint}.`
+    }
+  );
+}
+
+async function restoreAfterProbe() {
+  const config = await loadConfig();
+  await applyConfig(config);
+  await chrome.storage.local.remove(PROBE_KEY).catch(() => {});
+  probeState = null;
+}
+
+export async function startProbe(candidate) {
+  const validationError = validateProxy(candidate);
+  if (validationError) {
+    return { ok: false, reason: { code: "", title: "Прокси не сохранён", detail: validationError } };
+  }
+  if (probeState) {
+    return {
+      ok: false,
+      reason: { code: "", title: "Проверка уже идёт", detail: "Дождитесь окончания текущей проверки прокси." }
+    };
+  }
+
+  const config = await loadConfig();
+  const token = crypto.randomUUID();
+  probeState = { token, errorCode: "", endpoint: maskProxyEndpoint(candidate), proxy: candidate };
+
+  try {
+    await chrome.storage.local.set({ [PROBE_KEY]: token });
+    await chrome.proxy.settings.set({
+      value: {
+        mode: "fixed_servers",
+        rules: {
+          singleProxy: { scheme: candidate.scheme, host: candidate.host, port: candidate.port },
+          bypassList: []
+        }
+      },
+      scope: "regular"
+    });
+  } catch (error) {
+    await restoreAfterProbe();
+    const message = error && error.message ? error.message : String(error);
+    return { ok: false, reason: { code: "", title: "Не удалось включить прокси", detail: message } };
+  }
+
+  return {
+    ok: true,
+    token,
+    url: buildProbeUrl(config.domains, token),
+    endpoint: probeState.endpoint
+  };
+}
+
+export async function finishProbe({ token, fetchFailed, failureName, errorCode } = {}) {
+  const active = probeState;
+  const captured = active && active.token === token ? active.errorCode : "";
+  const code = readErrorCode(captured) || readErrorCode(errorCode) || (fetchFailed ? failureCodeFromName(failureName) : "");
+  const endpoint = (active && active.endpoint) || maskProxyEndpoint((await loadConfig()).proxy);
+
+  await restoreAfterProbe();
+
+  if (!fetchFailed && !captured) return { ok: true, code: "" };
+
+  return { ok: false, code: code || "ERR_PROXY_CONNECTION_FAILED", reason: probeReason(code, endpoint || "прокси") };
+}
+
 chrome.action.onClicked.addListener((tab) => handleToggle(tab));
 
 chrome.commands.onCommand.addListener((command, tab) => {
@@ -116,6 +203,14 @@ chrome.commands.onCommand.addListener((command, tab) => {
 
 chrome.webRequest.onAuthRequired.addListener(
   async (details, callback) => {
+    const candidate = probeState && probeState.proxy;
+    if (details.isProxy && candidate && candidate.scheme === "http" && candidate.username) {
+      const credentials = { username: candidate.username };
+      credentials.password = candidate.password;
+      callback({ authCredentials: credentials });
+      return;
+    }
+
     const config = await loadConfig();
     const proxy = config.proxy;
     const host = hostFromUrl(details.url);
@@ -132,9 +227,32 @@ chrome.webRequest.onAuthRequired.addListener(
 );
 
 chrome.webRequest.onErrorOccurred.addListener(
-  (details) => handleProxyFailure(details),
+  (details) => {
+    recordProbeError(details);
+    return handleProxyFailure(details);
+  },
   { urls: ["<all_urls>"] }
 );
+
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (!message || typeof message !== "object") return false;
+
+  if (message.type === "probe-start") {
+    startProbe(message.proxy).then(sendResponse, (error) =>
+      sendResponse({ ok: false, reason: { code: "", title: "Проверка не выполнена", detail: String(error) } })
+    );
+    return true;
+  }
+
+  if (message.type === "probe-finish") {
+    finishProbe(message).then(sendResponse, (error) =>
+      sendResponse({ ok: false, reason: { code: "", title: "Проверка не выполнена", detail: String(error) } })
+    );
+    return true;
+  }
+
+  return false;
+});
 
 chrome.webRequest.onCompleted.addListener(
   async (details) => {
@@ -178,6 +296,12 @@ chrome.proxy.onProxyError.addListener((details) => {
 });
 
 async function bootstrap() {
+  const stored = await chrome.storage.local.get(PROBE_KEY).catch(() => ({}));
+  if (stored && stored[PROBE_KEY]) {
+    probeState = null;
+    await chrome.storage.local.remove(PROBE_KEY).catch(() => {});
+  }
+
   const config = await loadConfig();
   const result = await applyConfig(config);
   if (result.error) await recordError(result.error);
