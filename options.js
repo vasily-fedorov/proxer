@@ -1,7 +1,7 @@
 import { domainFromInput } from "./lib/domains.js";
 import { buildProxyPatch } from "./lib/options-model.js";
 import { formatProxyEndpoint, maskProxyEndpoint } from "./lib/proxy.js";
-import { commitConfig, getProxyControl, loadConfig } from "./store.js";
+import { commitConfig, getProxyControl, invalidateConfigCache, loadConfig } from "./store.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -149,5 +149,15 @@ async function main() {
   render();
   await renderControl();
 }
+
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== "local" || !changes.config) return;
+  invalidateConfigCache();
+  void (async () => {
+    config = await loadConfig();
+    render();
+    await renderControl();
+  })();
+});
 
 void main();
