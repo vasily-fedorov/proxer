@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "Proxer",
+  "version": "0.1.0",
+  "description": "Прокси для выбранных сайтов в один клик",
+  "minimum_chrome_version": "108",
+  "permissions": ["proxy", "webRequest", "webRequestAuthProvider", "storage"],
+  "host_permissions": ["<all_urls>"],
+  "background": { "service_worker": "background.js", "type": "module" },
+  "action": { "default_title": "Прокси для этого сайта" },
+  "options_ui": { "page": "options.html", "open_in_tab": true },
+  "commands": {
+    "toggle-site": {
+      "suggested_key": { "default": "Ctrl+Shift+Y", "mac": "Command+Shift+Y" },
+      "description": "Включить/выключить прокси для текущего сайта"
+    }
+  }
+}
