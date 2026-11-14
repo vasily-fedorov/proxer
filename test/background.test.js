@@ -4,6 +4,7 @@ import { createChromeStub } from "./helpers/chrome-stub.js";
 
 function createBackgroundChrome(initialConfig) {
   const stub = createChromeStub({ config: initialConfig });
+  stub.tabUrl = "http://example.com/";
   const listeners = { clicked: [], command: [], auth: null, error: [] };
   const badges = [];
   const reloads = [];
@@ -24,7 +25,7 @@ function createBackgroundChrome(initialConfig) {
         reloads.push(tabId);
       },
       async get(tabId) {
-        return { id: tabId, url: "http://example.com/" };
+        return { id: tabId, url: stub.tabUrl };
       },
       async query() {
         return [];
@@ -137,4 +138,20 @@ test("onErrorOccurred обрабатывает только main_frame покр�
   assert.match(env.updates[0].props.url, /^chrome-extension:\/\/test\/proxy-error\.html\?/);
   assert.match(env.updates[0].props.url, /ERR_PROXY_CONNECTION_FAILED/);
   assert.match(env.updates[0].props.url, /url=https%3A%2F%2Fexample\.com%2F/);
+});
+
+test("onErrorOccurred перенаправляет, даже если Chrome уже подменил URL вкладки на chrome-error", async () => {
+  const env = await loadBackground({ version: 1, proxy, domains: ["example.com"], lastError: null });
+  env.stub.tabUrl = "chrome-error://chromewebdata/";
+
+  await env.listeners.error[0]({ tabId: 5, type: "main_frame", url: "https://example.com/", error: "net::ERR_PROXY_CONNECTION_FAILED" });
+  assert.equal(env.updates.length, 1);
+});
+
+test("onErrorOccurred не зацикливается, если вкладка уже на странице сбоя", async () => {
+  const env = await loadBackground({ version: 1, proxy, domains: ["example.com"], lastError: null });
+  env.stub.tabUrl = "chrome-extension://test/proxy-error.html?url=https%3A%2F%2Fexample.com%2F&code=ERR_TIMED_OUT";
+
+  await env.listeners.error[0]({ tabId: 5, type: "main_frame", url: "https://example.com/", error: "net::ERR_PROXY_CONNECTION_FAILED" });
+  assert.equal(env.updates.length, 0);
 });

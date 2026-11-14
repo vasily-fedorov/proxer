@@ -82,13 +82,16 @@ export async function handleProxyFailure(details) {
   } catch {
     return false;
   }
-  if (!tab || !isHttpUrl(tab.url)) return false;
+  if (!tab) return false;
+
+  const errorPageUrl = chrome.runtime.getURL(ERROR_PAGE);
+  if (typeof tab.url === "string" && tab.url.startsWith(errorPageUrl)) return false;
 
   await chrome.action.setBadgeText({ tabId: details.tabId, text: "!" });
   await chrome.action.setBadgeBackgroundColor({ tabId: details.tabId, color: RED });
 
   const params = new URLSearchParams({ url: details.url, code: reason.code });
-  await chrome.tabs.update(details.tabId, { url: `${chrome.runtime.getURL(ERROR_PAGE)}?${params.toString()}` });
+  await chrome.tabs.update(details.tabId, { url: `${errorPageUrl}?${params.toString()}` });
   return true;
 }
 
