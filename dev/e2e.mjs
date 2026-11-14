@@ -283,6 +283,64 @@ async function main() {
     assert.equal(await badgeFor("target.test"), "ON", "на покрытом сайте нет badge ON");
     assert.equal(await badgeFor("control.test"), "", "на непокрытом сайте badge не должен стоять");
 
+    const fill = async (id, value) => {
+      await evaluate(
+        browser,
+        optionsSession,
+        `(() => {
+           const el = document.getElementById(${JSON.stringify(id)});
+           el.value = ${JSON.stringify(value)};
+           el.dispatchEvent(new Event("input", { bubbles: true }));
+           el.dispatchEvent(new Event("change", { bubbles: true }));
+           return el.value;
+         })()`
+      );
+    };
+
+    const clickAndAwaitStatus = async (id, needle, timeout = 25000) => {
+      await evaluate(browser, optionsSession, `document.getElementById(${JSON.stringify(id)}).click()`);
+      return waitForText(
+        browser,
+        optionsSession,
+        `(() => {
+           const status = document.getElementById("proxy-status");
+           return status.textContent.includes(${JSON.stringify(needle)}) ? status.textContent : "";
+         })()`,
+        { timeout, label: `статус «${needle}»` }
+      );
+    };
+
+    const storedConfig = () =>
+      evaluate(
+        browser,
+        optionsSession,
+        `(async () => {
+           const { loadConfig, invalidateConfigCache } = await import("./store.js");
+           invalidateConfigCache();
+           const config = await loadConfig();
+           return { port: config.proxy ? config.proxy.port : null, domains: config.domains, error: config.lastError };
+         })()`
+      );
+
+    await fill("address", `127.0.0.1:${proxyPort}`);
+    const okStatus = await clickAndAwaitStatus("check-proxy", "Прокси доступен");
+    assert.match(okStatus, new RegExp(`127\\.0\\.0\\.1:${proxyPort}`), `проверка не подтвердила прокси: ${okStatus}`);
+
+    await fill("address", `127.0.0.1:${closedPort}`);
+    const failStatus = await clickAndAwaitStatus("save-proxy", "Не сохранено");
+    assert.match(failStatus, /не отвечает/i, `ожидали причину сбоя, получили: ${failStatus}`);
+
+    const afterFail = await storedConfig();
+    assert.equal(afterFail.port, proxyPort, `сохранение не должно было пройти, в конфиге порт ${afterFail.port}`);
+
+    await fill("address", `127.0.0.1:${authProxyPort}`);
+    await fill("username", "proxer");
+    await fill("password", "s3cret");
+    await clickAndAwaitStatus("save-proxy", "Прокси сохранён");
+
+    const afterAuth = await storedConfig();
+    assert.equal(afterAuth.port, authProxyPort, "прокси с авторизацией не сохранился");
+
     await configure({
       ...workingProxy,
       proxy: {
